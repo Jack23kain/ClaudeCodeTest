@@ -1,0 +1,840 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>💀 SURVIVOR 💀</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0f;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+  }
+  canvas {
+    display: block;
+    cursor: crosshair;
+    image-rendering: pixelated;
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+// ─── Canvas Setup ───────────────────────────────────────────────────────────
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const BASE_W = 800;
+const BASE_H = 600;
+canvas.width = BASE_W;
+canvas.height = BASE_H;
+
+// ─── Game States ────────────────────────────────────────────────────────────
+const STATE = { MENU: 'MENU', PLAYING: 'PLAYING', LEVEL_CLEAR: 'LEVEL_CLEAR', GAME_OVER: 'GAME_OVER' };
+let gameState = STATE.MENU;
+
+// ─── Input ───────────────────────────────────────────────────────────────────
+const keys = {};
+const mouse = { x: BASE_W / 2, y: BASE_H / 2, down: false };
+const lastKeyTime = {}; // for double-tap detection
+const dashCooldown = {}; // per-direction cooldown timestamps
+const DIRS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = BASE_W / rect.width;
+  const scaleY = BASE_H / rect.height;
+  mouse.x = (e.clientX - rect.left) * scaleX;
+  mouse.y = (e.clientY - rect.top) * scaleY;
+});
+
+canvas.addEventListener('mousedown', e => {
+  if (e.button === 0) {
+    mouse.down = true;
+    if (gameState === STATE.PLAYING) tryShoot();
+    else if (gameState === STATE.MENU) startGame(selectedLevel);
+    else if (gameState === STATE.GAME_OVER) { gameState = STATE.MENU; }
+    else if (gameState === STATE.LEVEL_CLEAR) nextLevel();
+  }
+});
+canvas.addEventListener('mouseup', e => { if (e.button === 0) mouse.down = false; });
+
+document.addEventListener('keydown', e => {
+  if (keys[e.code]) return; // already held
+  const now = performance.now();
+  // double-tap detection
+  if (DIRS.includes(e.code) && gameState === STATE.PLAYING) {
+    const dir = e.code;
+    if (lastKeyTime[dir] && now - lastKeyTime[dir] < 300) {
+      triggerDash(dir);
+    }
+    lastKeyTime[dir] = now;
+  }
+  keys[e.code] = true;
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => {
+  keys[e.code] = false;
+});
+
+// ─── Level Configs ───────────────────────────────────────────────────────────
+const LEVEL_CONFIGS = [
+  { killTarget: 20, spawnInterval: 2000, types: ['basic'],                    label: 'Level 1' },
+  { killTarget: 35, spawnInterval: 1400, types: ['basic','basic','fast'],     label: 'Level 2' },
+  { killTarget: 50, spawnInterval: 900,  types: ['basic','fast','fast','tank'], label: 'Level 3' },
+];
+
+// ─── Game Data ───────────────────────────────────────────────────────────────
+let player, bullets, enemies, particles, effects;
+let score, killCount, level, lives;
+let lastShot = 0;
+const SHOOT_COOLDOWN = 220; // ms between shots
+let autoFire = false;
+let levelClearTimer = 0;
+let spawnTimer = 0;
+let selectedLevel = 0;
+let unlockedLevels = parseInt(localStorage.getItem('survivor_unlocked') || '0');
+let highScore = parseInt(localStorage.getItem('survivor_hi') || '0');
+
+// Dash state
+let dashVx = 0, dashVy = 0, dashTimer = 0;
+const DASH_DURATION = 400;
+const DASH_SPEED = 520;
+const DASH_COOLDOWN = 1500;
+
+// ─── Init ────────────────────────────────────────────────────────────────────
+function startGame(lvl) {
+  level = lvl;
+  score = 0;
+  killCount = 0;
+  lives = 3;
+  bullets = [];
+  enemies = [];
+  particles = [];
+  effects = [];
+  spawnTimer = 0;
+  dashTimer = 0;
+  dashVx = 0; dashVy = 0;
+  Object.keys(dashCooldown).forEach(k => delete dashCooldown[k]);
+  Object.keys(lastKeyTime).forEach(k => delete lastKeyTime[k]);
+
+  player = {
+    x: BASE_W / 2,
+    y: BASE_H / 2,
+    size: 24,
+    angle: 0,
+    speed: 180,
+    invincible: 0,
+    trail: [],
+  };
+
+  gameState = STATE.PLAYING;
+  lastShot = 0;
+}
+
+function nextLevel() {
+  level++;
+  if (level >= LEVEL_CONFIGS.length) {
+    // Beat all levels
+    endGame(true);
+    return;
+  }
+  killCount = 0;
+  bullets = [];
+  enemies = [];
+  particles = [];
+  effects = [];
+  spawnTimer = 0;
+  dashTimer = 0;
+  dashVx = 0; dashVy = 0;
+  gameState = STATE.PLAYING;
+}
+
+function endGame(won) {
+  if (score > highScore) {
+    highScore = score;
+    localStorage.setItem('survivor_hi', highScore);
+  }
+  if (level + 1 > unlockedLevels) {
+    unlockedLevels = Math.min(level + 1, LEVEL_CONFIGS.length - 1);
+    localStorage.setItem('survivor_unlocked', unlockedLevels);
+  }
+  gameState = STATE.GAME_OVER;
+}
+
+// ─── Shooting ────────────────────────────────────────────────────────────────
+function tryShoot() {
+  const now = performance.now();
+  if (now - lastShot < SHOOT_COOLDOWN) return;
+  lastShot = now;
+
+  const dx = mouse.x - player.x;
+  const dy = mouse.y - player.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  const speed = 600;
+  bullets.push({
+    x: player.x,
+    y: player.y,
+    vx: (dx / dist) * speed,
+    vy: (dy / dist) * speed,
+    life: 1.2,
+  });
+  // Muzzle flash
+  effects.push({ type: 'flash', x: player.x, y: player.y, life: 0.1, maxLife: 0.1 });
+}
+
+// ─── Dash ────────────────────────────────────────────────────────────────────
+function triggerDash(dir) {
+  const now = performance.now();
+  if (dashCooldown[dir] && now - dashCooldown[dir] < DASH_COOLDOWN) return;
+  dashCooldown[dir] = now;
+
+  if (dir === 'ArrowUp')    { dashVx = 0;          dashVy = -DASH_SPEED; }
+  if (dir === 'ArrowDown')  { dashVx = 0;          dashVy =  DASH_SPEED; }
+  if (dir === 'ArrowLeft')  { dashVx = -DASH_SPEED; dashVy = 0; }
+  if (dir === 'ArrowRight') { dashVx =  DASH_SPEED; dashVy = 0; }
+
+  dashTimer = DASH_DURATION;
+  // Spawn dash trail ghosts
+  for (let i = 0; i < 4; i++) {
+    setTimeout(() => {
+      if (gameState === STATE.PLAYING) {
+        particles.push({
+          type: 'ghost',
+          x: player.x, y: player.y,
+          angle: player.angle,
+          life: 0.3, maxLife: 0.3,
+        });
+      }
+    }, i * 60);
+  }
+}
+
+// ─── Enemy Spawning ──────────────────────────────────────────────────────────
+const ENEMY_TYPES = {
+  basic: { emoji: '👾', hp: 1, speed: 80,  size: 22, score: 10, color: '#8f8' },
+  fast:  { emoji: '👺', hp: 1, speed: 155, size: 18, score: 20, color: '#f88' },
+  tank:  { emoji: '🤖', hp: 3, speed: 50,  size: 26, score: 50, color: '#88f' },
+};
+
+function spawnEnemy() {
+  const cfg = LEVEL_CONFIGS[level];
+  const typeKey = cfg.types[Math.floor(Math.random() * cfg.types.length)];
+  const tpl = ENEMY_TYPES[typeKey];
+
+  // Pick random edge point
+  let x, y;
+  const edge = Math.floor(Math.random() * 4);
+  const margin = 40;
+  if (edge === 0) { x = Math.random() * BASE_W; y = -margin; }
+  else if (edge === 1) { x = Math.random() * BASE_W; y = BASE_H + margin; }
+  else if (edge === 2) { x = -margin; y = Math.random() * BASE_H; }
+  else             { x = BASE_W + margin; y = Math.random() * BASE_H; }
+
+  // Direction toward player at spawn time
+  const dx = player.x - x;
+  const dy = player.y - y;
+  const d = Math.hypot(dx, dy) || 1;
+
+  enemies.push({
+    x, y,
+    vx: (dx / d) * tpl.speed,
+    vy: (dy / d) * tpl.speed,
+    hp: tpl.hp,
+    maxHp: tpl.hp,
+    speed: tpl.speed,
+    size: tpl.size,
+    emoji: tpl.emoji,
+    typeKey,
+    score: tpl.score,
+  });
+}
+
+// ─── Collision ───────────────────────────────────────────────────────────────
+function circleOverlap(ax, ay, ar, bx, by, br) {
+  return Math.hypot(ax - bx, ay - by) < ar + br;
+}
+
+// ─── Particles ───────────────────────────────────────────────────────────────
+function spawnDeathFX(x, y) {
+  effects.push({ type: 'death', x, y, life: 0.5, maxLife: 0.5 });
+  for (let i = 0; i < 6; i++) {
+    const ang = (Math.PI * 2 * i) / 6 + Math.random() * 0.5;
+    const spd = 60 + Math.random() * 80;
+    particles.push({
+      type: 'spark',
+      x, y,
+      vx: Math.cos(ang) * spd,
+      vy: Math.sin(ang) * spd,
+      life: 0.4 + Math.random() * 0.3,
+      maxLife: 0.6,
+      color: `hsl(${Math.random() * 60 + 20},100%,60%)`,
+    });
+  }
+}
+
+function spawnHitFX(x, y) {
+  effects.push({ type: 'hit', x, y, life: 0.15, maxLife: 0.15 });
+}
+
+// ─── Update ───────────────────────────────────────────────────────────────────
+let lastTime = 0;
+function update(ts) {
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+
+  if (gameState !== STATE.PLAYING) return;
+
+  const cfg = LEVEL_CONFIGS[level];
+
+  // ── Player movement
+  let mx = 0, my = 0;
+  if (keys['ArrowLeft'])  mx -= 1;
+  if (keys['ArrowRight']) mx += 1;
+  if (keys['ArrowUp'])    my -= 1;
+  if (keys['ArrowDown'])  my += 1;
+  if (mx !== 0 && my !== 0) { mx *= 0.707; my *= 0.707; }
+
+  // Dash
+  if (dashTimer > 0) {
+    dashTimer -= dt * 1000;
+    player.x += dashVx * dt;
+    player.y += dashVy * dt;
+  } else {
+    player.x += mx * player.speed * dt;
+    player.y += my * player.speed * dt;
+  }
+
+  // Clamp player
+  const ps = player.size;
+  player.x = Math.max(ps, Math.min(BASE_W - ps, player.x));
+  player.y = Math.max(ps, Math.min(BASE_H - ps, player.y));
+
+  // Player angle toward mouse
+  player.angle = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+
+  // Auto-fire while mouse held
+  if (mouse.down) tryShoot();
+
+  // Invincibility timer
+  if (player.invincible > 0) player.invincible -= dt;
+
+  // ── Bullets
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    if (b.life <= 0 || b.x < -20 || b.x > BASE_W + 20 || b.y < -20 || b.y > BASE_H + 20) {
+      bullets.splice(i, 1);
+    }
+  }
+
+  // ── Spawn enemies
+  spawnTimer -= dt * 1000;
+  if (spawnTimer <= 0 && killCount < cfg.killTarget) {
+    spawnTimer = cfg.spawnInterval;
+    // Spawn 1-2 at a time in later levels
+    spawnEnemy();
+    if (level >= 1 && Math.random() < 0.4) spawnEnemy();
+    if (level >= 2 && Math.random() < 0.25) spawnEnemy();
+  }
+
+  // ── Update enemies
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+
+    // Check bullet collisions
+    for (let j = bullets.length - 1; j >= 0; j--) {
+      const b = bullets[j];
+      if (circleOverlap(e.x, e.y, e.size * 0.5, b.x, b.y, 5)) {
+        bullets.splice(j, 1);
+        e.hp--;
+        spawnHitFX(b.x, b.y);
+        if (e.hp <= 0) {
+          spawnDeathFX(e.x, e.y);
+          score += e.score;
+          killCount++;
+          enemies.splice(i, 1);
+          break;
+        }
+      }
+    }
+    if (i >= enemies.length) continue; // was removed
+
+    // Check player collision
+    if (player.invincible <= 0 && circleOverlap(e.x, e.y, e.size * 0.5, player.x, player.y, player.size * 0.45)) {
+      lives--;
+      player.invincible = 1.5;
+      effects.push({ type: 'damage', x: player.x, y: player.y, life: 0.4, maxLife: 0.4 });
+      enemies.splice(i, 1);
+      if (lives <= 0) {
+        endGame(false);
+        return;
+      }
+      continue;
+    }
+
+    // Remove if off-screen far
+    if (e.x < -200 || e.x > BASE_W + 200 || e.y < -200 || e.y > BASE_H + 200) {
+      enemies.splice(i, 1);
+    }
+  }
+
+  // ── Update particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.type === 'spark') { p.x += p.vx * dt; p.y += p.vy * dt; }
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  // ── Update effects
+  for (let i = effects.length - 1; i >= 0; i--) {
+    effects[i].life -= dt;
+    if (effects[i].life <= 0) effects.splice(i, 1);
+  }
+
+  // ── Level clear check
+  if (killCount >= cfg.killTarget && enemies.length === 0) {
+    levelClearTimer = 0;
+    gameState = STATE.LEVEL_CLEAR;
+  }
+}
+
+// ─── Render ───────────────────────────────────────────────────────────────────
+function render(ts) {
+  ctx.clearRect(0, 0, BASE_W, BASE_H);
+
+  if (gameState === STATE.MENU) { renderMenu(); return; }
+  if (gameState === STATE.GAME_OVER) { renderGameOver(); return; }
+  if (gameState === STATE.LEVEL_CLEAR) { renderLevelClear(); return; }
+
+  // ── Background grid
+  ctx.strokeStyle = 'rgba(0,255,80,0.06)';
+  ctx.lineWidth = 1;
+  const gridSize = 40;
+  for (let x = 0; x < BASE_W; x += gridSize) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, BASE_H); ctx.stroke();
+  }
+  for (let y = 0; y < BASE_H; y += gridSize) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(BASE_W, y); ctx.stroke();
+  }
+
+  // ── Particles (ghost trails)
+  for (const p of particles) {
+    const alpha = p.life / p.maxLife;
+    if (p.type === 'ghost') {
+      ctx.save();
+      ctx.globalAlpha = alpha * 0.35;
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.angle);
+      ctx.font = '22px serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('🧍', 0, 0);
+      ctx.restore();
+    } else if (p.type === 'spark') {
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // ── Bullets
+  ctx.fillStyle = '#ffe066';
+  for (const b of bullets) {
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
+    ctx.fill();
+    // Glow
+    ctx.save();
+    ctx.globalAlpha = 0.3;
+    ctx.fillStyle = '#ffcc00';
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ── Enemies
+  ctx.font = '22px serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (const e of enemies) {
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    ctx.fillText(e.emoji, 0, 0);
+    // Health bar for tanks
+    if (e.maxHp > 1) {
+      const bw = e.size * 1.6;
+      const bh = 4;
+      const bx = -bw / 2;
+      const by = -e.size - 4;
+      ctx.fillStyle = '#333';
+      ctx.fillRect(bx, by, bw, bh);
+      ctx.fillStyle = e.hp === 3 ? '#4f4' : e.hp === 2 ? '#ff4' : '#f44';
+      ctx.fillRect(bx, by, bw * (e.hp / e.maxHp), bh);
+    }
+    ctx.restore();
+  }
+
+  // ── Effects
+  for (const ef of effects) {
+    const alpha = ef.life / ef.maxLife;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    if (ef.type === 'death') {
+      ctx.font = '28px serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('💀', ef.x, ef.y);
+    } else if (ef.type === 'hit') {
+      ctx.font = '18px serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('💥', ef.x, ef.y);
+    } else if (ef.type === 'flash') {
+      ctx.font = '20px serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('💥', ef.x - Math.cos(player.angle) * 10, ef.y - Math.sin(player.angle) * 10);
+    } else if (ef.type === 'damage') {
+      ctx.fillStyle = 'rgba(255,0,0,' + alpha * 0.5 + ')';
+      ctx.beginPath();
+      ctx.arc(ef.x, ef.y, 40, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ── Player
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  // Invincibility blink
+  if (player.invincible > 0 && Math.floor(player.invincible * 10) % 2 === 0) {
+    ctx.globalAlpha = 0.3;
+  }
+  ctx.rotate(player.angle - Math.PI / 2);
+  ctx.font = `${player.size * 1.8}px serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('🧍', 0, 0);
+  ctx.restore();
+
+  // ── HUD
+  renderHUD();
+}
+
+function renderHUD() {
+  const cfg = LEVEL_CONFIGS[level];
+
+  // Background bars
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(0, 0, BASE_W, 44);
+  ctx.fillRect(0, BASE_H - 30, BASE_W, 30);
+
+  // Lives
+  ctx.font = '20px serif';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  for (let i = 0; i < lives; i++) ctx.fillText('❤️', 10 + i * 26, 22);
+  for (let i = lives; i < 3; i++) {
+    ctx.save(); ctx.globalAlpha = 0.2;
+    ctx.fillText('❤️', 10 + i * 26, 22);
+    ctx.restore();
+  }
+
+  // Score & Level
+  ctx.fillStyle = '#0f0';
+  ctx.font = 'bold 16px "Courier New"';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`SCORE: ${score}`, BASE_W - 10, 14);
+  ctx.fillStyle = '#8ff';
+  ctx.fillText(`${cfg.label.toUpperCase()}`, BASE_W - 10, 30);
+
+  // Wave progress bar
+  const prog = Math.min(killCount / cfg.killTarget, 1);
+  const bw = BASE_W - 160;
+  const bh = 12;
+  const bx = 80;
+  const by = BASE_H - 22;
+  ctx.fillStyle = '#222';
+  ctx.fillRect(bx, by, bw, bh);
+  const barColor = prog < 0.5 ? '#4f4' : prog < 0.8 ? '#ff4' : '#f84';
+  ctx.fillStyle = barColor;
+  ctx.fillRect(bx, by, bw * prog, bh);
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(bx, by, bw, bh);
+  ctx.fillStyle = '#fff';
+  ctx.font = '11px "Courier New"';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`${killCount} / ${cfg.killTarget} KILLS`, BASE_W / 2, by + bh / 2);
+
+  // Dash cooldown indicators
+  let dashX = 10;
+  const dashY = BASE_H - 22;
+  const now = performance.now();
+  const dirMap = [
+    { key: 'ArrowUp', label: '↑' },
+    { key: 'ArrowDown', label: '↓' },
+    { key: 'ArrowLeft', label: '←' },
+    { key: 'ArrowRight', label: '→' },
+  ];
+  ctx.font = '10px "Courier New"';
+  ctx.textBaseline = 'middle';
+  for (const d of dirMap) {
+    const elapsed = dashCooldown[d.key] ? now - dashCooldown[d.key] : DASH_COOLDOWN;
+    const frac = Math.min(elapsed / DASH_COOLDOWN, 1);
+    ctx.fillStyle = frac >= 1 ? '#4f4' : '#666';
+    ctx.textAlign = 'center';
+    ctx.fillText(d.label, dashX + 8, dashY + 6);
+    dashX += 18;
+  }
+}
+
+function renderMenu() {
+  // Background
+  ctx.fillStyle = '#050510';
+  ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(0,100,255,0.07)';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < BASE_W; x += 40) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, BASE_H); ctx.stroke();
+  }
+  for (let y = 0; y < BASE_H; y += 40) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(BASE_W, y); ctx.stroke();
+  }
+
+  // Title
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 64px "Courier New"';
+  ctx.fillStyle = '#0f0';
+  ctx.shadowColor = '#0f0';
+  ctx.shadowBlur = 20;
+  ctx.fillText('💀 SURVIVOR 💀', BASE_W / 2, 130);
+  ctx.shadowBlur = 0;
+
+  ctx.font = '18px "Courier New"';
+  ctx.fillStyle = '#8f8';
+  ctx.fillText('A TOP-DOWN SHOOTER', BASE_W / 2, 180);
+
+  // High score
+  ctx.font = 'bold 20px "Courier New"';
+  ctx.fillStyle = '#ff4';
+  ctx.fillText(`HIGH SCORE: ${highScore}`, BASE_W / 2, 230);
+
+  // Level select
+  ctx.font = 'bold 22px "Courier New"';
+  ctx.fillStyle = '#fff';
+  ctx.fillText('SELECT LEVEL:', BASE_W / 2, 295);
+
+  const lvlBtns = [
+    { label: '1', x: BASE_W / 2 - 100, unlocked: true },
+    { label: '2', x: BASE_W / 2,        unlocked: unlockedLevels >= 1 },
+    { label: '3', x: BASE_W / 2 + 100,  unlocked: unlockedLevels >= 2 },
+  ];
+
+  for (let i = 0; i < lvlBtns.length; i++) {
+    const btn = lvlBtns[i];
+    const selected = selectedLevel === i;
+    const r = 28;
+    ctx.beginPath();
+    ctx.arc(btn.x, 345, r, 0, Math.PI * 2);
+    if (!btn.unlocked) {
+      ctx.fillStyle = '#222';
+      ctx.fill();
+      ctx.strokeStyle = '#444';
+    } else {
+      ctx.fillStyle = selected ? '#0f0' : '#082008';
+      ctx.fill();
+      ctx.strokeStyle = selected ? '#0f0' : '#4f4';
+    }
+    ctx.lineWidth = selected ? 3 : 2;
+    ctx.stroke();
+
+    ctx.font = `bold 20px "Courier New"`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = btn.unlocked ? (selected ? '#000' : '#4f4') : '#444';
+    ctx.fillText(btn.label, btn.x, 345);
+
+    if (!btn.unlocked) {
+      ctx.font = '18px serif';
+      ctx.fillText('🔒', btn.x, 345);
+    }
+  }
+
+  // Enemy preview for selected level
+  const previews = [
+    ['👾'],
+    ['👾', '👺'],
+    ['👾', '👺', '🤖'],
+  ];
+  ctx.font = '20px serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#aaa';
+  ctx.font = '13px "Courier New"';
+  ctx.fillText('ENEMIES:', BASE_W / 2, 400);
+  ctx.font = '26px serif';
+  const prev = previews[selectedLevel];
+  for (let i = 0; i < prev.length; i++) {
+    ctx.fillText(prev[i], BASE_W / 2 - (prev.length - 1) * 20 + i * 40, 432);
+  }
+
+  // Controls reminder
+  ctx.font = '13px "Courier New"';
+  ctx.fillStyle = '#555';
+  ctx.fillText('ARROWS: move   DOUBLE-TAP: dash   CLICK: shoot', BASE_W / 2, 490);
+
+  // Start button
+  const pulse = 0.85 + 0.15 * Math.sin(performance.now() / 300);
+  ctx.save();
+  ctx.globalAlpha = pulse;
+  ctx.font = 'bold 26px "Courier New"';
+  ctx.fillStyle = '#0f0';
+  ctx.shadowColor = '#0f0';
+  ctx.shadowBlur = 10;
+  ctx.fillText('[ CLICK TO START ]', BASE_W / 2, 545);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+
+  // Mouse hover for level buttons — detect and change selectedLevel
+  for (let i = 0; i < lvlBtns.length; i++) {
+    const btn = lvlBtns[i];
+    if (lvlBtns[i].unlocked && Math.hypot(mouse.x - btn.x, mouse.y - 345) < 28) {
+      selectedLevel = i;
+    }
+  }
+}
+
+function renderLevelClear() {
+  ctx.fillStyle = 'rgba(5,10,5,0.92)';
+  ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  ctx.font = 'bold 54px "Courier New"';
+  ctx.fillStyle = '#0f0';
+  ctx.shadowColor = '#0f0';
+  ctx.shadowBlur = 18;
+  ctx.fillText('LEVEL CLEAR!', BASE_W / 2, 200);
+  ctx.shadowBlur = 0;
+
+  ctx.font = '28px "Courier New"';
+  ctx.fillStyle = '#ff4';
+  ctx.fillText(`SCORE: ${score}`, BASE_W / 2, 290);
+
+  if (level + 1 < LEVEL_CONFIGS.length) {
+    ctx.font = '22px "Courier New"';
+    ctx.fillStyle = '#8ff';
+    ctx.fillText(`NEXT: LEVEL ${level + 2}`, BASE_W / 2, 360);
+    const pulse = 0.8 + 0.2 * Math.sin(performance.now() / 300);
+    ctx.save();
+    ctx.globalAlpha = pulse;
+    ctx.font = 'bold 22px "Courier New"';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('[ CLICK TO CONTINUE ]', BASE_W / 2, 430);
+    ctx.restore();
+  } else {
+    ctx.font = 'bold 30px "Courier New"';
+    ctx.fillStyle = '#ff4';
+    ctx.fillText('YOU WIN! ALL LEVELS CLEARED!', BASE_W / 2, 370);
+    const pulse = 0.8 + 0.2 * Math.sin(performance.now() / 300);
+    ctx.save();
+    ctx.globalAlpha = pulse;
+    ctx.font = 'bold 22px "Courier New"';
+    ctx.fillStyle = '#0f0';
+    ctx.fillText('[ CLICK TO RETURN TO MENU ]', BASE_W / 2, 440);
+    ctx.restore();
+  }
+}
+
+function renderGameOver() {
+  ctx.fillStyle = 'rgba(8,0,0,0.95)';
+  ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  ctx.font = '56px serif';
+  ctx.fillText('💀', BASE_W / 2, 150);
+
+  ctx.font = 'bold 52px "Courier New"';
+  ctx.fillStyle = '#f44';
+  ctx.shadowColor = '#f00';
+  ctx.shadowBlur = 20;
+  ctx.fillText('GAME OVER', BASE_W / 2, 240);
+  ctx.shadowBlur = 0;
+
+  ctx.font = '26px "Courier New"';
+  ctx.fillStyle = '#ff4';
+  ctx.fillText(`SCORE: ${score}`, BASE_W / 2, 315);
+
+  ctx.font = '20px "Courier New"';
+  ctx.fillStyle = '#8ff';
+  ctx.fillText(`LEVEL REACHED: ${level + 1}`, BASE_W / 2, 360);
+
+  if (score >= highScore && score > 0) {
+    ctx.font = 'bold 22px "Courier New"';
+    ctx.fillStyle = '#ff4';
+    ctx.fillText('NEW HIGH SCORE!', BASE_W / 2, 405);
+  } else {
+    ctx.font = '18px "Courier New"';
+    ctx.fillStyle = '#888';
+    ctx.fillText(`HIGH SCORE: ${highScore}`, BASE_W / 2, 405);
+  }
+
+  const pulse = 0.8 + 0.2 * Math.sin(performance.now() / 350);
+  ctx.save();
+  ctx.globalAlpha = pulse;
+  ctx.font = 'bold 24px "Courier New"';
+  ctx.fillStyle = '#fff';
+  ctx.fillText('[ CLICK TO RETURN TO MENU ]', BASE_W / 2, 480);
+  ctx.restore();
+}
+
+// ─── Main Loop ────────────────────────────────────────────────────────────────
+function loop(ts) {
+  if (!lastTime) lastTime = ts;
+  update(ts);
+  render(ts);
+  requestAnimationFrame(loop);
+}
+
+// Handle LEVEL_CLEAR click to go to menu if all done
+canvas.addEventListener('click', e => {
+  if (gameState === STATE.LEVEL_CLEAR) {
+    if (level + 1 >= LEVEL_CONFIGS.length) {
+      if (score > highScore) {
+        highScore = score;
+        localStorage.setItem('survivor_hi', highScore);
+      }
+      gameState = STATE.MENU;
+      selectedLevel = 0;
+    }
+  }
+});
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

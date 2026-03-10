@@ -1,0 +1,9 @@
+ I want to create a simple top down shooter game that is runnable in the browser.  
+
+I want to have some sprites, or at least cool kind of character animations. I want my character to have a gun.  I want enemies to kind of be coming at him from different angles like a bullet hell game.  I want to be able to move with the arrow keys and then use my mouse to point and click at the different enemies and shoot them.  With the arrow keys if you double tap direction you will move faster for a short time in the same direction.  
+
+We should have levels, we should progress clearly, we should have a menu screen. We should keep it relatively simply and kind of like a 2D retro style.
+
+---
+
+Create a plan for this game, and then we'll start executing and coding it.                                                                                                                                                                                                                                                             
